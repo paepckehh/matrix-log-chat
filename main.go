@@ -1,100 +1,90 @@
+// Command matrix-log-chat reads syslog lines from stdin, translates each
+// line into an emoji-decorated chat message, and forwards it to a Matrix
+// room. Configuration is environment-only; run `MATRIX_DRY_RUN=true` to
+// preview the rendered messages on stderr without posting anything.
+// Set DEBUG=1 (or MATRIX_DEBUG=1) to enable verbose slog output.
 package main
 
 import (
-	"flag"
-	"fmt"
-	"io"
+	"bufio"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/matrix-org/gomatrix"
-	"github.com/nxadm/tail"
+	"paepcke.de/matrix-log-chat/internal/config"
+	"paepcke.de/matrix-log-chat/internal/logging"
+	"paepcke.de/matrix-log-chat/internal/matrix"
+	"paepcke.de/matrix-log-chat/internal/syslog"
+	"paepcke.de/matrix-log-chat/internal/transform"
+	"paepcke.de/matrix-log-chat/version"
 )
 
 func main() {
-	// ── CLI flags ──────────────────────────────────────────────────────────────
-	filePath   := flag.String("file",       "",            "Path to syslog file to follow (required)")
-	homeserver := flag.String("homeserver", "",            "Matrix homeserver URL, e.g. https://matrix.org (required)")
-	token      := flag.String("token",      "",            "Matrix access token (required)")
-	roomID     := flag.String("room",       "",            "Matrix room ID, e.g. !abc123:matrix.org (required)")
-	rateMs     := flag.Int64 ("rate",       300,           "Minimum ms between messages to avoid flooding (default 300)")
-	fromStart  := flag.Bool  ("from-start", false,         "Replay existing file content before following new lines")
-	flag.Parse()
+	log.SetFlags(log.Ltime | log.Lmsgprefix)
+	log.SetPrefix("matrix-log-chat: ")
 
-	// ── Validate required flags ────────────────────────────────────────────────
-	missing := []string{}
-	if *filePath   == "" { missing = append(missing, "--file") }
-	if *homeserver == "" { missing = append(missing, "--homeserver") }
-	if *token      == "" { missing = append(missing, "--token") }
-	if *roomID     == "" { missing = append(missing, "--room") }
-	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: missing required flags: %v\n\n", missing)
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	rateLimit := time.Duration(*rateMs) * time.Millisecond
-
-	// ── Matrix client ──────────────────────────────────────────────────────────
-	cli, err := gomatrix.NewClient(*homeserver, "", *token)
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("matrix: failed to create client: %v", err)
+		log.Fatalf("config: %v", err)
 	}
+	// Wire the logger now that we know the DEBUG flag. This must run
+	// before any package logs anything meaningful.
+	logging.Configure(cfg.Debug)
 
-	// Quick connectivity check — whoami
-	resp, err := cli.Whoami()
+	logging.L().Info("starting",
+		"version", version.Version, "build", version.Build,
+		"mode", mode(cfg.DryRun), "debug", cfg.Debug,
+	)
+	log.Println(transform.Summary(cfg.Homeserver, cfg.User, cfg.Room, cfg.DryRun))
+
+	sender, err := matrix.New(cfg, os.Stderr)
 	if err != nil {
-		log.Fatalf("matrix: auth check failed (bad token or homeserver?): %v", err)
-	}
-	log.Printf("matrix: authenticated as %s", resp.UserID)
-
-	// ── Tail config ────────────────────────────────────────────────────────────
-	seekInfo := &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd} // only new lines by default
-	if *fromStart {
-		seekInfo = &tail.SeekInfo{Offset: 0, Whence: io.SeekStart}
+		log.Fatalf("startup: %v", err)
 	}
 
-	t, err := tail.TailFile(*filePath, tail.Config{
-		Follow:    true,
-		ReOpen:    true, // handles log rotation
-		MustExist: true,
-		Location:  seekInfo,
-		Logger:    tail.DiscardingLogger,
-	})
-	if err != nil {
-		log.Fatalf("tail: failed to open %q: %v", *filePath, err)
-	}
-	defer t.Cleanup()
-
-	log.Printf("following %s → Matrix room %s (rate limit: %s)", *filePath, *roomID, rateLimit)
-
-	// ── Graceful shutdown ──────────────────────────────────────────────────────
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	// SIGINT/SIGTERM: stop after the in-flight line finishes. Scanner
+	// stops on stdin EOF naturally; the signal path ensures a piped
+	// producer that never closes is still interruptible.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigs
+		sig := <-stop
+		logging.L().Info("signal received, shutting down", "signal", sig)
 		log.Println("shutting down…")
-		t.Stop()
+		_ = os.Stdin.Close()
 	}()
 
-	// ── Main loop ──────────────────────────────────────────────────────────────
-	for line := range t.Lines {
-		if line.Err != nil {
-			log.Printf("tail error: %v", line.Err)
-			continue
-		}
-		text := line.Text
-		if text == "" {
-			continue
-		}
+	scanner := bufio.NewScanner(os.Stdin)
+	// Syslog lines can be long (multi-kB stack traces, NDJSON, etc.).
+	// Raise the per-line limit well above the default 64 KiB so we do
+	// not silently truncate.
+	const maxLine = 256 * 1024
+	scanner.Buffer(make([]byte, 0, maxLine), maxLine)
 
-		if _, err := cli.SendText(*roomID, text); err != nil {
-			log.Printf("matrix: send failed: %v — line dropped: %s", err, text)
-		}
-
-		time.Sleep(rateLimit) // avoid flooding the room
+	lines := 0
+	for scanner.Scan() {
+		lines++
+		ev := syslog.Parse(scanner.Text())
+		logging.L().Debug("parsed",
+			"format", ev.Format,
+			"facility", ev.FacilityName(),
+			"severity", ev.SeverityName(),
+			"app", ev.App,
+			"host", ev.Hostname,
+		)
+		sender.Send(transform.ToChat(ev))
 	}
+	if err := scanner.Err(); err != nil {
+		logging.L().Error("scanner error", "err", err)
+		log.Printf("stdin: %v", err)
+	}
+	logging.L().Info("exit", "lines", lines)
+}
+
+func mode(dryRun bool) string {
+	if dryRun {
+		return "dry-run"
+	}
+	return "live"
 }
