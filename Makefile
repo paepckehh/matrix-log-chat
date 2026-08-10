@@ -31,7 +31,7 @@ test:
 	go test ./...
 
 check:
-	gofmt -w -s .
+	go fmt -w -s .
 	go vet ./...
 	go fix ./...
 	go test ./...
@@ -49,5 +49,6 @@ deps:
 	rm go.mod go.sum
 	go mod init $(MODULE)
 	go mod tidy -v
+	git config core.fileMode false
 
 .PHONY: all info version build run test check patch deps
