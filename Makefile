@@ -21,7 +21,11 @@ build:
 	CGO_ENABLED=$(CGO) go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(PROJECT) .
 
 run: build
-	./$(PROJECT)
+	 MATRIX_HOMESERVER="https://matrix.debitor.de" \
+	 MATRIX_USER="..." \
+	 MATRIX_TOKEN="..." \
+	 MATRIX_ROOM="!test" \
+	 ./$(PROJECT)
 
 test:
 	go test ./...
